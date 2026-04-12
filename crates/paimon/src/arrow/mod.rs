@@ -19,6 +19,7 @@ pub(crate) mod filtering;
 pub(crate) mod format;
 mod reader;
 pub(crate) mod schema_evolution;
+pub(crate) mod sort_merge;
 
 pub use crate::arrow::reader::ArrowReaderBuilder;
 

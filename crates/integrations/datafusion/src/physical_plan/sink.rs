@@ -81,7 +81,7 @@ impl DataSink for PaimonDataSink {
         _context: &Arc<TaskContext>,
     ) -> DFResult<u64> {
         let wb = self.table.new_write_builder();
-        let mut tw = wb.new_write().map_err(to_datafusion_error)?;
+        let mut tw = wb.new_write().await.map_err(to_datafusion_error)?;
         let mut row_count = 0u64;
 
         while let Some(batch) = data.next().await {

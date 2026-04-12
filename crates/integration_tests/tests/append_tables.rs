@@ -127,7 +127,7 @@ fn collect_string_col(batches: &[RecordBatch], col: &str) -> Vec<String> {
 /// Write batches → commit → scan → read, return all batches.
 async fn write_commit_read(table: &Table, batches: Vec<RecordBatch>) -> Vec<RecordBatch> {
     let wb = table.new_write_builder();
-    let mut tw = wb.new_write().unwrap();
+    let mut tw = wb.new_write().await.unwrap();
     for batch in &batches {
         tw.write_arrow_batch(batch).await.unwrap();
     }
@@ -200,7 +200,7 @@ async fn test_unpartitioned_two_commits() {
 
     // First commit
     let wb = table.new_write_builder();
-    let mut tw = wb.new_write().unwrap();
+    let mut tw = wb.new_write().await.unwrap();
     tw.write_arrow_batch(&int_batch(vec![1, 2], vec![10, 20]))
         .await
         .unwrap();
@@ -210,7 +210,7 @@ async fn test_unpartitioned_two_commits() {
         .unwrap();
 
     // Second commit
-    let mut tw2 = wb.new_write().unwrap();
+    let mut tw2 = wb.new_write().await.unwrap();
     tw2.write_arrow_batch(&int_batch(vec![3, 4], vec![30, 40]))
         .await
         .unwrap();
@@ -242,7 +242,7 @@ async fn test_unpartitioned_projection() {
 
     // Write
     let wb = table.new_write_builder();
-    let mut tw = wb.new_write().unwrap();
+    let mut tw = wb.new_write().await.unwrap();
     tw.write_arrow_batch(&int_batch(vec![1, 2, 3], vec![10, 20, 30]))
         .await
         .unwrap();
@@ -313,7 +313,7 @@ async fn test_fixed_bucket_scan_filters_by_bucket() {
 
     // Write enough data to spread across buckets
     let wb = table.new_write_builder();
-    let mut tw = wb.new_write().unwrap();
+    let mut tw = wb.new_write().await.unwrap();
     tw.write_arrow_batch(&int_batch(
         vec![1, 2, 3, 4, 5, 6, 7, 8],
         vec![10, 20, 30, 40, 50, 60, 70, 80],
@@ -411,7 +411,7 @@ async fn test_partitioned_two_commits() {
     let wb = table.new_write_builder();
 
     // First commit: partition "a"
-    let mut tw1 = wb.new_write().unwrap();
+    let mut tw1 = wb.new_write().await.unwrap();
     tw1.write_arrow_batch(&partitioned_batch(vec!["a", "a"], vec![1, 2]))
         .await
         .unwrap();
@@ -421,7 +421,7 @@ async fn test_partitioned_two_commits() {
         .unwrap();
 
     // Second commit: partition "b"
-    let mut tw2 = wb.new_write().unwrap();
+    let mut tw2 = wb.new_write().await.unwrap();
     tw2.write_arrow_batch(&partitioned_batch(vec!["b", "b"], vec![3, 4]))
         .await
         .unwrap();
@@ -456,7 +456,7 @@ async fn test_partitioned_scan_partition_filter() {
 
     // Write data to two partitions
     let wb = table.new_write_builder();
-    let mut tw = wb.new_write().unwrap();
+    let mut tw = wb.new_write().await.unwrap();
     tw.write_arrow_batch(&partitioned_batch(
         vec!["a", "b", "a", "b"],
         vec![1, 2, 3, 4],
@@ -536,7 +536,7 @@ async fn test_partitioned_fixed_bucket_write_read() {
     let table = make_table(&file_io, path, partitioned_bucket_schema(2));
 
     let wb = table.new_write_builder();
-    let mut tw = wb.new_write().unwrap();
+    let mut tw = wb.new_write().await.unwrap();
     tw.write_arrow_batch(&partitioned_value_batch(
         vec!["a", "a", "b", "b"],
         vec![1, 2, 3, 4],
@@ -564,31 +564,8 @@ async fn test_partitioned_fixed_bucket_write_read() {
 }
 
 // ---------------------------------------------------------------------------
-// Unsupported: primary key table should be rejected
+// Unsupported: fixed bucket without bucket-key should be rejected
 // ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn test_reject_primary_key_table() {
-    let schema = Schema::builder()
-        .column("id", DataType::Int(IntType::new()))
-        .column("value", DataType::Int(IntType::new()))
-        .primary_key(["id"])
-        .build()
-        .unwrap();
-    let table_schema = TableSchema::new(0, &schema);
-
-    let file_io = memory_file_io();
-    let path = "memory:/append_reject_pk";
-    let table = make_table(&file_io, path, table_schema);
-
-    let result = table.new_write_builder().new_write();
-    assert!(result.is_err());
-    let err = result.err().unwrap();
-    assert!(
-        matches!(&err, paimon::Error::Unsupported { message } if message.contains("primary keys")),
-        "Expected Unsupported error for PK table, got: {err:?}"
-    );
-}
 
 #[tokio::test]
 async fn test_reject_fixed_bucket_without_bucket_key() {
@@ -604,7 +581,7 @@ async fn test_reject_fixed_bucket_without_bucket_key() {
     let path = "memory:/append_reject_no_bucket_key";
     let table = make_table(&file_io, path, table_schema);
 
-    let result = table.new_write_builder().new_write();
+    let result = table.new_write_builder().new_write().await;
     assert!(result.is_err());
     let err = result.err().unwrap();
     assert!(

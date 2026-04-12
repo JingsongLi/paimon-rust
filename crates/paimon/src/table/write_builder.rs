@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 /// Builder for creating table writers and committers.
 ///
-/// Provides `new_write` (TODO) and `new_commit` methods, with optional
+/// Provides `new_write` and `new_commit` methods, with optional
 /// `overwrite` support for partition-level overwrites.
 pub struct WriteBuilder<'a> {
     table: &'a Table,
@@ -45,7 +45,15 @@ impl<'a> WriteBuilder<'a> {
     }
 
     /// Create a new TableWrite for writing Arrow data.
-    pub fn new_write(&self) -> crate::Result<TableWrite> {
-        TableWrite::new(self.table)
+    ///
+    /// For primary-key tables, this scans the latest snapshot to determine
+    /// the next sequence number.
+    pub async fn new_write(&self) -> crate::Result<TableWrite> {
+        let next_seq = if self.table.schema().primary_keys().is_empty() {
+            0
+        } else {
+            TableWrite::scan_next_sequence_number(self.table).await?
+        };
+        TableWrite::new(self.table, next_seq)
     }
 }

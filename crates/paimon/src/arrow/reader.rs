@@ -18,9 +18,10 @@
 use crate::arrow::build_target_arrow_schema;
 use crate::arrow::format::create_format_reader;
 use crate::arrow::schema_evolution::{create_index_mapping, NULL_FIELD_INDEX};
+use crate::arrow::sort_merge::{DeduplicateMergeFunction, SortMergeReaderBuilder};
 use crate::deletion_vector::{DeletionVector, DeletionVectorFactory};
 use crate::io::FileIO;
-use crate::spec::{DataField, DataFileMeta, Predicate, ROW_ID_FIELD_NAME};
+use crate::spec::{DataField, DataFileMeta, DataType as PaimonDataType, BigIntType, Predicate, ROW_ID_FIELD_NAME};
 use crate::table::schema_manager::SchemaManager;
 use crate::table::ArrowRecordBatchStream;
 use crate::table::RowRange;
@@ -337,6 +338,210 @@ impl ArrowReader {
         }
         .boxed())
     }
+
+    /// Read primary-key table data files using sort-merge with a LoserTree.
+    ///
+    /// Each data file in a split is read as a separate sorted stream. The streams
+    /// are merged by primary key using a LoserTree, and rows with the same key are
+    /// deduplicated by keeping the one with the highest `_SEQUENCE_NUMBER`.
+    ///
+    /// `primary_keys` are the primary key column names from the table schema.
+    ///
+    /// Reference: Java Paimon `SortMergeReaderWithMinHeap`.
+    pub fn read_sort_merge(
+        self,
+        data_splits: &[DataSplit],
+        primary_keys: &[String],
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        let user_read_type = self.read_type.clone();
+        let table_fields = self.table_fields.clone();
+
+        // Build the internal read type: key columns + _SEQUENCE_NUMBER + value columns.
+        // We need all primary key columns for merging, plus _SEQUENCE_NUMBER for dedup.
+        let seq_field = DataField::new(
+            i32::MAX - 10, // reserved field id for _SEQUENCE_NUMBER
+            "_SEQUENCE_NUMBER".to_string(),
+            PaimonDataType::BigInt(BigIntType::new()),
+        );
+
+        // Collect key fields from table schema.
+        let key_fields: Vec<DataField> = primary_keys
+            .iter()
+            .map(|pk| {
+                table_fields
+                    .iter()
+                    .find(|f| f.name() == pk)
+                    .cloned()
+                    .ok_or_else(|| Error::UnexpectedError {
+                        message: format!("Primary key column '{pk}' not found in table schema"),
+                        source: None,
+                    })
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+
+        // Value fields = user_read_type fields that are NOT key columns.
+        let key_names: std::collections::HashSet<&str> =
+            primary_keys.iter().map(|s| s.as_str()).collect();
+        let value_fields: Vec<DataField> = user_read_type
+            .iter()
+            .filter(|f| !key_names.contains(f.name()))
+            .cloned()
+            .collect();
+
+        // Internal read type: keys + _SEQUENCE_NUMBER + values
+        let mut internal_read_type: Vec<DataField> = Vec::new();
+        internal_read_type.extend(key_fields.clone());
+        internal_read_type.push(seq_field);
+        internal_read_type.extend(value_fields.clone());
+
+        let internal_schema = build_target_arrow_schema(&internal_read_type)?;
+
+        // Output schema: keys + values (in user_read_type order)
+        let output_schema = build_target_arrow_schema(&user_read_type)?;
+
+        // Compute indices within internal_schema.
+        let num_keys = key_fields.len();
+        let seq_index = num_keys; // _SEQUENCE_NUMBER is right after keys
+        let key_indices: Vec<usize> = (0..num_keys).collect();
+        let value_indices: Vec<usize> = (num_keys + 1..internal_read_type.len()).collect();
+
+        // Compute output column mapping: for each column in user_read_type,
+        // find its position in the output (keys first, then values).
+        let output_key_indices: Vec<usize> = user_read_type
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| key_names.contains(f.name()))
+            .map(|(i, _)| i)
+            .collect();
+        let output_value_indices: Vec<usize> = user_read_type
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| !key_names.contains(f.name()))
+            .map(|(i, _)| i)
+            .collect();
+
+        // Build the reorder mapping: merge output is [keys..., values...],
+        // but user wants them in user_read_type order.
+        // reorder_map[output_pos] = merge_output_pos
+        let mut reorder_map: Vec<usize> = vec![0; user_read_type.len()];
+        for (merge_idx, &out_idx) in output_key_indices.iter().enumerate() {
+            reorder_map[out_idx] = merge_idx;
+        }
+        for (merge_idx, &out_idx) in output_value_indices.iter().enumerate() {
+            reorder_map[out_idx] = num_keys + merge_idx;
+        }
+
+        let file_io = self.file_io.clone();
+        let batch_size = self.batch_size;
+        let predicates = self.predicates;
+        let schema_manager = self.schema_manager;
+        let table_schema_id = self.table_schema_id;
+        let splits: Vec<DataSplit> = data_splits.to_vec();
+
+        // Build the merge output schema (keys + values, no _SEQUENCE_NUMBER).
+        let mut merge_output_fields: Vec<DataField> = Vec::new();
+        merge_output_fields.extend(key_fields);
+        merge_output_fields.extend(value_fields);
+        let merge_output_schema = build_target_arrow_schema(&merge_output_fields)?;
+
+        Ok(try_stream! {
+            for split in &splits {
+                // Create one stream per data file.
+                let mut file_streams: Vec<ArrowRecordBatchStream> = Vec::new();
+
+                for file_meta in split.data_files().to_vec() {
+                    let data_fields: Option<Vec<DataField>> = if file_meta.schema_id != table_schema_id {
+                        let data_schema = schema_manager.schema(file_meta.schema_id).await?;
+                        Some(data_schema.fields().to_vec())
+                    } else {
+                        None
+                    };
+
+                    let stream = read_single_file_stream(
+                        file_io.clone(),
+                        SingleFileReadRequest {
+                            split: split.clone(),
+                            file_meta,
+                            read_type: internal_read_type.clone(),
+                            table_fields: table_fields.clone(),
+                            data_fields,
+                            predicates: predicates.clone(),
+                            batch_size,
+                            dv: None,
+                            row_ranges: None,
+                        },
+                    )?;
+                    file_streams.push(stream);
+                }
+
+                if file_streams.is_empty() {
+                    continue;
+                }
+
+                // If only one file, no merge needed — just strip _SEQUENCE_NUMBER.
+                if file_streams.len() == 1 {
+                    let mut stream = file_streams.into_iter().next().unwrap();
+                    while let Some(batch) = stream.next().await {
+                        let batch = batch?;
+                        let batch = strip_and_reorder(&batch, &reorder_map, seq_index, &output_schema)?;
+                        yield batch;
+                    }
+                    continue;
+                }
+
+                let mut merge_stream = SortMergeReaderBuilder::new(
+                    file_streams,
+                    internal_schema.clone(),
+                    key_indices.clone(),
+                    seq_index,
+                    value_indices.clone(),
+                    merge_output_schema.clone(),
+                    Box::new(DeduplicateMergeFunction),
+                )
+                .build()?;
+
+                while let Some(batch) = merge_stream.next().await {
+                    let batch = batch?;
+                    // Reorder columns from [keys..., values...] to user_read_type order.
+                    let columns: Vec<_> = reorder_map
+                        .iter()
+                        .map(|&src| batch.column(src).clone())
+                        .collect();
+                    let reordered = RecordBatch::try_new(output_schema.clone(), columns)
+                        .map_err(|e| Error::UnexpectedError {
+                            message: format!("Failed to reorder merged RecordBatch: {e}"),
+                            source: Some(Box::new(e)),
+                        })?;
+                    yield reordered;
+                }
+            }
+        }
+        .boxed())
+    }
+}
+
+/// Strip _SEQUENCE_NUMBER and reorder columns for single-file fast path.
+fn strip_and_reorder(
+    batch: &RecordBatch,
+    reorder_map: &[usize],
+    seq_index: usize,
+    output_schema: &Arc<arrow_schema::Schema>,
+) -> crate::Result<RecordBatch> {
+    // Build source indices: skip seq_index, then reorder.
+    let mut non_seq_cols: Vec<arrow_array::ArrayRef> = Vec::new();
+    for (i, col) in batch.columns().iter().enumerate() {
+        if i != seq_index {
+            non_seq_cols.push(col.clone());
+        }
+    }
+    let columns: Vec<_> = reorder_map
+        .iter()
+        .map(|&src| non_seq_cols[src].clone())
+        .collect();
+    RecordBatch::try_new(output_schema.clone(), columns).map_err(|e| Error::UnexpectedError {
+        message: format!("Failed to strip/reorder RecordBatch: {e}"),
+        source: Some(Box::new(e)),
+    })
 }
 
 struct SingleFileReadRequest {

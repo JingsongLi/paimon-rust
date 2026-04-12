@@ -323,12 +323,19 @@ impl<'a> TableRead<'a> {
         let data_evolution = core_options.data_evolution_enabled();
 
         if has_primary_keys && !deletion_vectors_enabled {
-            return Err(Error::Unsupported {
-                message: format!(
-                    "Reading primary-key tables without deletion vectors is not yet supported. Primary keys: {:?}",
-                    self.table.schema.primary_keys()
-                ),
-            });
+            let reader = ArrowReaderBuilder::new(
+                self.table.file_io.clone(),
+                self.table.schema_manager().clone(),
+                self.table.schema().id(),
+            )
+            .with_predicates(self.data_predicates.clone())
+            .with_table_fields(self.table.schema.fields().to_vec())
+            .build(self.read_type().to_vec());
+
+            return reader.read_sort_merge(
+                data_splits,
+                self.table.schema.primary_keys(),
+            );
         }
 
         let reader = ArrowReaderBuilder::new(

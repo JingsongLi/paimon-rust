@@ -1478,7 +1478,7 @@ async fn test_read_complex_type_table() {
 // PK-without-DV and non-PK-with-DV tests
 // ---------------------------------------------------------------------------
 
-/// Reading a primary-key table without deletion vectors should return an Unsupported error.
+/// Reading a primary-key table without deletion vectors should work via sort-merge reader.
 #[tokio::test]
 async fn test_read_pk_table_without_dv_returns_error() {
     let catalog = create_file_system_catalog();
@@ -1493,16 +1493,17 @@ async fn test_read_pk_table_without_dv_returns_error() {
     );
 
     let read = table.new_read_builder().new_read();
-    let result = read
+    let stream = read
         .expect("new_read should succeed")
-        .to_arrow(plan.splits());
-    let err = result
-        .err()
-        .expect("Reading PK table without DV should fail");
+        .to_arrow(plan.splits())
+        .expect("to_arrow should succeed for PK table via sort-merge");
 
+    let batches: Vec<_> = futures::TryStreamExt::try_collect(stream)
+        .await
+        .expect("Reading PK table without DV should succeed via sort-merge reader");
     assert!(
-        matches!(&err, Error::Unsupported { message } if message.contains("primary-key")),
-        "Expected Unsupported error about primary-key tables, got: {err:?}"
+        !batches.is_empty(),
+        "PK table read should return non-empty results"
     );
 }
 

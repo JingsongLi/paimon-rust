@@ -323,8 +323,12 @@ async fn execute_vector_index_work(
     let index_meta_bytes = global_meta.index_meta.clone().unwrap_or_default();
     let row_range_start = global_meta.row_range_start;
     let vector_searches = work.queries;
-    let mut options = evaluation.table_options.clone();
-    options.extend(vector_searches[0].options.clone());
+    let options = super::vector_search_common::vector_read_options(
+        evaluation.table_options,
+        &vector_searches[0].options,
+        &vector_searches[0].field_name,
+        &work.entry.index_file.index_type,
+    )?;
     let input = evaluation.file_io.new_input(&path);
     if vector_searches.iter().all(|search| {
         search
@@ -574,7 +578,6 @@ async fn scalar_matched_row_ids(
     vector_ranges: &[RowRange],
     filter: &Predicate,
 ) -> crate::Result<Option<RoaringTreemap>> {
-    let core = CoreOptions::new(evaluation.table_options);
     // Java search pre-filters use per-column coverage and exclude multi-field
     // definitions, even though ordinary table scans can use composite indexes.
     let scalar_entries: Vec<_> = entries
@@ -588,6 +591,12 @@ async fn scalar_matched_row_ids(
         })
         .cloned()
         .collect();
+    let resolved = GlobalIndexScanner::read_defaults(
+        evaluation.table_options,
+        &scalar_entries,
+        evaluation.schema_fields,
+    )?;
+    let core = CoreOptions::new(&resolved);
     let scanner = GlobalIndexScanner::create_with_fm_options(
         evaluation.file_io,
         evaluation.table_path,
@@ -601,7 +610,7 @@ async fn scalar_matched_row_ids(
             .iter()
             .any(|entry| entry.index_file.index_type.eq_ignore_ascii_case("fm"))
         {
-            crate::fm_index::FMOptions::from_options(evaluation.table_options)?.read
+            crate::fm_index::FMOptions::from_options(&resolved)?.read
         } else {
             crate::fm_index::FMReadOptions::default()
         },
@@ -609,6 +618,7 @@ async fn scalar_matched_row_ids(
     let Some(scanner) = scanner else {
         return Ok(None);
     };
+    let scanner = scanner.with_field_options(evaluation.table_options, &scalar_entries)?;
     let Some((ranges, exact)) = scanner.matching_ranges_with_exactness(filter).await? else {
         return Ok(None);
     };
@@ -1750,8 +1760,9 @@ fn vector_metric_override(
 ) -> crate::Result<Option<RawVectorMetric>> {
     // A known index family determines its own defaults and option namespace.
     // Only a search without a family may infer a metric from suffixes.
-    if index_type.is_some() {
-        direct_raw_vector_metric_override(options, field_name, index_type)
+    if let Some(kind) = index_type {
+        let resolved = CoreOptions::new(options).vector_index_options(kind, field_name, false)?;
+        direct_raw_vector_metric_override(&resolved, field_name, Some(kind))
     } else {
         configured_raw_vector_metric_override(options, field_name)
     }

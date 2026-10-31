@@ -514,17 +514,49 @@ pub(super) fn configured_refine_factor(
     field_name: &str,
     index_type: &str,
 ) -> crate::Result<usize> {
-    if let Some(value) =
-        configured_refine_factor_from_options(search_options, field_name, index_type)
-    {
+    let query =
+        CoreOptions::new(search_options).vector_index_options(index_type, field_name, false)?;
+    if let Some(value) = configured_refine_factor_from_options(&query, field_name, index_type) {
         return parse_refine_factor(&value);
     }
-    if let Some(value) =
-        configured_refine_factor_from_options(table_options, field_name, index_type)
-    {
+    let resolved =
+        CoreOptions::new(table_options).vector_index_options(index_type, field_name, false)?;
+    if let Some(value) = configured_refine_factor_from_options(&resolved, field_name, index_type) {
         return parse_refine_factor(&value);
     }
     Ok(0)
+}
+
+/// Resolve each source before merging so a broad query option outranks every
+/// table field alias. Native readers consume their established query keys.
+pub(super) fn vector_read_options(
+    table: &HashMap<String, String>,
+    query: &HashMap<String, String>,
+    column: &str,
+    kind: &str,
+) -> crate::Result<HashMap<String, String>> {
+    let resolve = |source: &HashMap<String, String>| -> crate::Result<HashMap<String, String>> {
+        let mut options = CoreOptions::new(source).vector_index_options(kind, column, false)?;
+        for (native, suffixes) in [
+            ("ivf.nprobe", &["nprobe", "ivf.nprobe"][..]),
+            ("diskann.l_search", &["l_search", "diskann.l_search"][..]),
+        ] {
+            let value = indexed_type_prefixes(column, kind)
+                .iter()
+                .find_map(|prefix| {
+                    suffixes
+                        .iter()
+                        .find_map(|suffix| options.get(&format!("{prefix}{suffix}")).cloned())
+                });
+            if let Some(value) = value {
+                options.insert(native.into(), value);
+            }
+        }
+        Ok(options)
+    };
+    let mut options = resolve(table)?;
+    options.extend(resolve(query)?);
+    Ok(options)
 }
 
 fn configured_refine_factor_from_options(
@@ -562,8 +594,11 @@ fn parse_refine_factor(value: &str) -> crate::Result<usize> {
 }
 
 /// A malformed PK configuration must not reject an unrelated DE query.
-pub(super) fn targets_primary_key_column(core: &CoreOptions<'_>, column: &str) -> bool {
-    core.primary_key_vector_index_enabled()
+pub(super) fn targets_primary_key_column(table: &Table, column: &str) -> bool {
+    let core = table.schema().core_options();
+    !table.schema().primary_keys().is_empty()
+        && !core.data_evolution_enabled()
+        && core.primary_key_vector_index_enabled()
         && core
             .primary_key_vector_index_columns()
             .ok()
@@ -575,6 +610,54 @@ mod tests {
     use super::*;
     use crate::io::FileIOBuilder;
     use crate::spec::{GlobalIndexMeta, IndexFileMeta};
+
+    #[test]
+    fn shared_read_options_keep_query_precedence_and_refinement() {
+        let table = HashMap::from([
+            (
+                "fields.embedding.index-options".into(),
+                r#"{"nprobe":8,"refine-factor":3}"#.into(),
+            ),
+            ("fields.embedding.nprobe".into(), "4".into()),
+            ("ivf.nprobe".into(), "2".into()),
+        ]);
+        assert_eq!(
+            vector_read_options(&table, &HashMap::new(), "embedding", "ivf-flat").unwrap()
+                ["ivf.nprobe"],
+            "8"
+        );
+        let query = HashMap::from([
+            ("ivf.nprobe".into(), "1".into()),
+            ("refine-factor".into(), "2".into()),
+        ]);
+        assert_eq!(
+            vector_read_options(&table, &query, "embedding", "ivf-flat").unwrap()["ivf.nprobe"],
+            "1"
+        );
+        assert_eq!(
+            configured_refine_factor(&HashMap::new(), &table, "embedding", "ivf-flat").unwrap(),
+            3
+        );
+        assert_eq!(
+            configured_refine_factor(&query, &table, "embedding", "ivf-flat").unwrap(),
+            2
+        );
+        let query_json = HashMap::from([(
+            "fields.embedding.index-options".into(),
+            r#"{"nprobe":1,"refine-factor":2}"#.into(),
+        )]);
+        assert_eq!(
+            vector_read_options(&table, &query_json, "embedding", "ivf-flat").unwrap()
+                ["ivf.nprobe"],
+            "1"
+        );
+        for defaults in [&table, &HashMap::new()] {
+            assert_eq!(
+                configured_refine_factor(&query_json, defaults, "embedding", "ivf-flat").unwrap(),
+                2
+            );
+        }
+    }
 
     fn entry(index_meta: Option<Vec<u8>>) -> IndexManifestEntry {
         IndexManifestEntry {

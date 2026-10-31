@@ -292,6 +292,15 @@ fn validate_user_option_keys(
                 .strip_prefix(&format!("{index_type}."))
                 .or_else(|| key.strip_prefix(&format!("fields.{field}.")))
                 .unwrap_or(key);
+            if matches!(
+                suffix,
+                "refine-factor" | "refine_factor" | "rerank-factor" | "rerank_factor"
+            ) || (index_type != DISKANN_IDENTIFIER && matches!(suffix, "nprobe" | "ivf.nprobe"))
+                || (index_type == DISKANN_IDENTIFIER
+                    && matches!(suffix, "l_search" | "diskann.l_search"))
+            {
+                return false;
+            }
             if suffix == "train.sample-ratio" {
                 return key.as_str() == suffix;
             }
@@ -415,6 +424,11 @@ fn collect_native_options(
             let Some(native_key) = native_option_key(suffix) else {
                 continue;
             };
+            // DLF prefers dimension over index.dimension within each source.
+            // Iterating alias keys in hash order must not choose the dimension.
+            if suffix == "index.dimension" && options.contains_key(&format!("{prefix}dimension")) {
+                continue;
+            }
             // Schema options follow Java. Explicit Rust/SQL builder options also
             // accept the documented native aliases.
             if prefix.is_empty()

@@ -23,6 +23,120 @@ use arrow_array::builder::{Float32Builder, ListBuilder};
 use arrow_array::{ArrayRef, StringArray};
 
 #[tokio::test]
+async fn unified_and_dlf_declarations_share_build_and_raw_search_options() {
+    for suffix in ["index-columns", "index-column"] {
+        let vector_key = format!("global-index.ivf-flat.{suffix}");
+        let text_key = format!("global-index.full-text.{suffix}");
+        let (_catalog, table) = search_table(&[
+            (&vector_key, "embedding"),
+            (&text_key, "text"),
+            ("ivf-flat.dimension", "9"),
+            ("fields.embedding.dimension", "2"),
+            ("fields.embedding.nlist", "1"),
+            ("fields.embedding.global-index.row-count-per-shard", "1"),
+            ("fields.embedding.distance.metric", "cosine"),
+            ("fields.text.index-options", r#"{"lower-case":false}"#),
+        ])
+        .await;
+        TableCommit::new(table.clone(), "unified-config".into())
+            .commit(search_messages(&table, &[[1., 0.], [0., 1.]]).await)
+            .await
+            .unwrap();
+        let entries = indexes(&table).await;
+        assert_eq!(entries.len(), 3);
+        let mut ranges = entries
+            .iter()
+            .filter(|entry| entry.index_file.index_type == "ivf-flat")
+            .map(|entry| {
+                let meta = entry.index_file.global_index_meta.as_ref().unwrap();
+                (meta.row_range_start, meta.row_range_end)
+            })
+            .collect::<Vec<_>>();
+        ranges.sort_unstable();
+        assert_eq!(ranges, vec![(0, 0), (1, 1)]);
+        let vector = entries
+            .iter()
+            .find(|e| e.index_file.index_type == "ivf-flat")
+            .unwrap();
+        let meta: HashMap<String, String> = serde_json::from_slice(
+            vector
+                .index_file
+                .global_index_meta
+                .as_ref()
+                .unwrap()
+                .index_meta
+                .as_ref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(meta["dimension"], "2");
+        assert_eq!(meta["metric"], "cosine");
+        let indexed = vector_scores(&table, "fast").await;
+        let bad_read_options = table.copy_with_options(HashMap::from([(
+            "fields.embedding.index-options".into(),
+            r#"{"nprobe":"invalid"}"#.into(),
+        )]));
+        let error = bad_read_options
+            .new_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vector(vec![1., 0.])
+            .with_limit(2)
+            .with_options(HashMap::from([(
+                "vector-index.search-mode".into(),
+                "fast".into(),
+            )]))
+            .execute()
+            .await
+            .expect_err("shared read parameters must reach the native reader");
+        assert!(error.to_string().contains("ivf.nprobe"), "{error}");
+        bad_read_options
+            .new_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vector(vec![1., 0.])
+            .with_limit(2)
+            .with_options(HashMap::from([
+                ("vector-index.search-mode".into(), "fast".into()),
+                ("ivf.nprobe".into(), "1".into()),
+            ]))
+            .execute()
+            .await
+            .unwrap();
+        for kind in ["ivf-flat", "full-text"] {
+            let column = if kind == "full-text" {
+                "text"
+            } else {
+                "embedding"
+            };
+            table
+                .new_global_index_drop_builder()
+                .with_index_type(kind)
+                .with_index_column(column)
+                .execute()
+                .await
+                .unwrap();
+        }
+        for mode in ["full", "detail"] {
+            let raw = vector_scores(&table, mode).await;
+            assert_eq!(raw.row_ids, indexed.row_ids);
+            assert_eq!(raw.scores, indexed.scores);
+            let hits = table
+                .copy_with_options(HashMap::from([(
+                    "global-index.search-mode".into(),
+                    mode.into(),
+                )]))
+                .new_full_text_search_builder()
+                .with_text_column("text")
+                .with_query_text("FOO")
+                .with_limit(4)
+                .execute()
+                .await
+                .unwrap();
+            assert_eq!(hits.row_ids().unwrap().row_ids, vec![0]);
+        }
+    }
+}
+
+#[tokio::test]
 async fn filtered_build_views_preserve_snapshot_and_unrelated_index_coverage() {
     use crate::table::global_index_build_common::{
         indexed_row_ranges, validate_existing_index_overlap, GlobalIndexBuildView,

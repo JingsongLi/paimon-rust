@@ -18,13 +18,11 @@
 //! Java-compatible declarations for source-backed primary-key indexes.
 
 use crate::spec::{CoreOptions, DataField, DataType, TableSchema};
-use crate::table::global_index_options::parse_field_index_options;
-use crate::table::global_index_types::normalize_global_index_type;
 use crate::table::index_build::full_text;
 use crate::table::Table;
 use crate::vindex::VindexVectorIndexOptions;
 use crate::{Error, Result};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 pub(super) struct Definition {
     pub field: DataField,
@@ -38,89 +36,45 @@ pub(super) fn field_options(
     family: &str,
     index_type: &str,
 ) -> Result<HashMap<String, String>> {
-    let key = format!("fields.{column}.pk-{family}.index.options");
-    let prefix = if matches!(family, "vector" | "full-text") {
-        format!("{index_type}.")
-    } else {
-        format!("{family}-index.")
-    };
-    let mut resolved =
-        parse_field_index_options(options, column, &key, &prefix, family == "vector")?;
-    if family == "vector" {
-        let metric = CoreOptions::new(options).primary_key_vector_distance_metric(column)?;
-        let expected = crate::vindex::pkvector::metric::VectorSearchMetric::parse(&metric)?;
-        resolved.insert(format!("{index_type}.metric"), metric);
-        // Native field aliases outrank the algorithm key within this map. Do
-        // not let them contradict the metric used for ANN/exact result merging.
-        for key in [
-            format!("fields.{column}.metric"),
-            format!("fields.{column}.distance.metric"),
-            format!("{index_type}.distance.metric"),
-        ] {
-            if let Some(value) = resolved.get(&key) {
-                if crate::vindex::pkvector::metric::VectorSearchMetric::parse(value)? != expected {
-                    return Err(Error::ConfigInvalid {
-                        message: format!(
-                            "{key} conflicts with fields.{column}.pk-vector.distance.metric"
-                        ),
-                    });
-                }
-            }
-        }
-    }
-    Ok(resolved)
+    crate::table::global_index_options::field_index_options(options, column, family, index_type)
 }
 
 pub(super) fn vector_index_type(
     options: &HashMap<String, String>,
     column: &str,
 ) -> Result<&'static str> {
-    let configured = CoreOptions::new(options).primary_key_vector_index_type(column)?;
-    normalize_global_index_type(configured.trim())
-        .filter(|kind| crate::vindex::is_vindex_index_type(kind))
-        .ok_or_else(|| Error::ConfigInvalid {
-            message: format!("Unsupported primary-key vector index type: {configured}"),
-        })
+    crate::table::global_index_options::vector_index_type(options, column)?.ok_or_else(|| {
+        Error::ConfigInvalid {
+            message: format!("fields.{column}.pk-vector.index.type is required but not set"),
+        }
+    })
 }
 
 pub(super) fn definitions(schema: &TableSchema) -> Result<Vec<Definition>> {
     let options = schema.options();
-    let mut owners = HashMap::new();
-    for family in ["btree", "bitmap", "multivalue", "fm", "full-text", "vector"] {
-        let key = format!("pk-{family}.index.columns");
-        if let Some(columns) = options.get(&key) {
-            let mut unique = HashSet::new();
-            for column in columns.split(',').map(str::trim) {
-                if column.is_empty() || !unique.insert(column) {
-                    return Err(Error::ConfigInvalid {
-                        message: format!("{key} contains an empty or duplicate column '{column}'"),
-                    });
-                }
-                if !schema.fields().iter().any(|field| field.name() == column) {
-                    return Err(Error::ConfigInvalid {
-                        message: format!("{key} contains unknown column '{column}'"),
-                    });
-                }
-                if owners.insert(column, family).is_some() {
-                    return Err(Error::ConfigInvalid {
-                        message: format!("Column '{column}' can own at most one primary-key index"),
-                    });
-                }
-            }
+    let owners = crate::table::global_index_options::declarations(options)?
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+    for column in owners.keys() {
+        if !schema.fields().iter().any(|field| field.name() == column) {
+            return Err(Error::ConfigInvalid {
+                message: format!("Primary-key index contains unknown column '{column}'"),
+            });
         }
     }
-    if options.contains_key("pk-vector.index.columns") {
+    if CoreOptions::new(options).primary_key_vector_index_enabled() {
         schema.core_options().primary_key_vector_index_column()?;
     }
     let mut result = Vec::new();
     for field in schema.fields() {
-        let Some(&family) = owners.get(field.name()) else {
+        let Some(kind) = owners.get(field.name()) else {
             continue;
         };
-        let kind = if family == "vector" {
-            vector_index_type(options, field.name())?
+        let kind = kind.as_str();
+        let family = if crate::vindex::is_vindex_index_type(kind) {
+            "vector"
         } else {
-            family
+            kind
         };
         let configured = field_options(options, field.name(), family, kind)?;
         let mut merged = options.clone();

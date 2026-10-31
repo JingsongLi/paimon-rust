@@ -716,7 +716,7 @@ impl<'a> HybridSearchBuilder<'a> {
         let mut any_pk = false;
         let mut any_global = false;
         for route in &self.routes {
-            if route_is_primary_key(core, route) {
+            if route_is_primary_key(core, route, !self.table.schema().primary_keys().is_empty()) {
                 any_pk = true;
             } else {
                 any_global = true;
@@ -1052,7 +1052,14 @@ enum HybridAddressSpace {
 /// non-erroring accessor so a malformed config cannot misclassify an unrelated
 /// route). Full-text: data-evolution disabled AND the column configured in
 /// `pk-full-text.index.columns`.
-fn route_is_primary_key(core: &CoreOptions<'_>, route: &HybridSearchRoute) -> bool {
+fn route_is_primary_key(
+    core: &CoreOptions<'_>,
+    route: &HybridSearchRoute,
+    primary_key: bool,
+) -> bool {
+    if !primary_key || core.data_evolution_enabled() {
+        return false;
+    }
     match route.kind {
         HybridSearchRouteKind::Vector => {
             core.primary_key_vector_index_enabled()

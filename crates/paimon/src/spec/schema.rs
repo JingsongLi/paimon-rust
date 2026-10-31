@@ -479,7 +479,7 @@ impl TableSchema {
                             message: format!("Cannot rename partition column: [{name}]"),
                         });
                     }
-                    assert_not_updating_primary_key_index_column(&self.options, name, "rename")?;
+                    assert_not_updating_primary_key_index_column(self, name, "rename")?;
                     let idx =
                         field_index(&fields, name).ok_or_else(|| crate::Error::ColumnNotExist {
                             full_name: full_name.to_string(),
@@ -533,7 +533,7 @@ impl TableSchema {
                             ),
                         });
                     }
-                    assert_not_updating_primary_key_index_column(&self.options, name, "drop")?;
+                    assert_not_updating_primary_key_index_column(self, name, "drop")?;
                     assert_not_updating_bucket_key_column(
                         &old_bucket_key_field_ids,
                         &fields[idx],
@@ -621,11 +621,7 @@ impl TableSchema {
                             message: "Cannot update primary key".to_string(),
                         });
                     }
-                    assert_not_updating_primary_key_index_column(
-                        &self.options,
-                        name,
-                        "update type of",
-                    )?;
+                    assert_not_updating_primary_key_index_column(self, name, "update type of")?;
                     let idx =
                         field_index(&fields, name).ok_or_else(|| crate::Error::ColumnNotExist {
                             full_name: full_name.to_string(),
@@ -864,11 +860,15 @@ fn assert_nullability_change(
 /// name and type. Mirrors Java
 /// `SchemaManager.assertNotUpdatingPrimaryKeyIndexColumn`.
 fn assert_not_updating_primary_key_index_column(
-    options: &HashMap<String, String>,
+    schema: &TableSchema,
     field_name: &str,
     operation: &str,
 ) -> crate::Result<()> {
+    let options = schema.options();
     let core_options = CoreOptions::new(options);
+    if schema.primary_keys().is_empty() || core_options.data_evolution_enabled() {
+        return Ok(());
+    }
     let is_vector_index_column = core_options.primary_key_vector_index_enabled()
         && core_options
             .primary_key_vector_index_columns()?
@@ -882,9 +882,10 @@ fn assert_not_updating_primary_key_index_column(
     let is_scalar_index_column = ["btree", "bitmap", "multivalue", "fm"]
         .iter()
         .any(|family| {
-            options
-                .get(&format!("pk-{family}.index.columns"))
-                .is_some_and(|columns| columns.split(',').any(|column| column.trim() == field_name))
+            core_options
+                .global_index_columns(family)
+                .iter()
+                .any(|column| column == field_name)
         });
     if is_vector_index_column || is_full_text_index_column || is_scalar_index_column {
         return Err(crate::Error::Unsupported {
@@ -1433,8 +1434,15 @@ impl Schema {
         if !core_options.is_format_table() {
             core_options.target_file_row_num()?;
         }
-        Self::validate_primary_key_vector_index(fields, primary_keys, options)?;
-        Self::validate_primary_key_full_text_index(fields, primary_keys, options)?;
+        if !core_options.data_evolution_enabled()
+            && (!primary_keys.is_empty()
+                || options
+                    .keys()
+                    .any(|key| key.starts_with("pk-") && key.ends_with(".index.columns")))
+        {
+            Self::validate_primary_key_vector_index(fields, primary_keys, options)?;
+            Self::validate_primary_key_full_text_index(fields, primary_keys, options)?;
+        }
         Ok(())
     }
 
@@ -2327,7 +2335,7 @@ impl Schema {
             });
         }
 
-        core.primary_key_vector_distance_metric(&column)
+        core.legacy_primary_key_vector_distance_metric(&column)
             .map(|_| ())
             .map_err(Self::options_error_to_config_invalid)
     }

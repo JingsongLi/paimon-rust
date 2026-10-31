@@ -26,8 +26,8 @@ use crate::spec::{
     should_read_pk_index_source, CoreOptions, DataField, DataFileMeta, FileKind,
     IndexManifestEntry, Predicate, PrimaryKeyIndexSourceMeta,
 };
-use crate::{Error, Result};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use crate::Result;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 
@@ -45,30 +45,16 @@ pub(super) struct Definition {
 }
 
 pub(super) fn definitions(fields: &[DataField], options: &Options) -> Result<Vec<Definition>> {
-    let mut owners = HashMap::new();
-    for family in ["btree", "bitmap", "vector", "full-text", "multivalue", "fm"] {
-        let key = format!("pk-{family}.index.columns");
-        if let Some(columns) = options.get(&key) {
-            let mut unique = HashSet::new();
-            for column in columns.split(',').map(str::trim) {
-                if !unique.insert(column) {
-                    return Err(config_invalid(format!(
-                        "{key} contains duplicate column '{column}'"
-                    )));
-                }
-                if owners.insert(column, family).is_some() {
-                    return Err(config_invalid(format!(
-                        "Column '{column}' can own at most one primary-key index"
-                    )));
-                }
-            }
-        }
-    }
+    let owners = super::global_index_options::declarations_for_read(options)?
+        .into_iter()
+        .collect::<HashMap<_, _>>();
     let mut result = Vec::new();
     for field in fields {
-        let Some(&family @ ("btree" | "bitmap")) = owners.get(field.name()) else {
+        let Some(family @ ("btree" | "bitmap")) = owners.get(field.name()).map(String::as_str)
+        else {
             continue;
         };
+        let family = if family == "btree" { "btree" } else { "bitmap" };
         result.push(Definition {
             field_id: field.id(),
             index_type: family,
@@ -76,10 +62,6 @@ pub(super) fn definitions(fields: &[DataField], options: &Options) -> Result<Vec
         });
     }
     Ok(result)
-}
-
-fn config_invalid(message: String) -> Error {
-    Error::ConfigInvalid { message }
 }
 
 fn definition_options(options: &Options, column: &str, family: &str) -> Result<Options> {

@@ -24,7 +24,10 @@ mod planning;
 
 impl TableCommit {
     pub(super) async fn auto_index_enabled(&self, has_new_files: bool) -> Result<bool> {
-        if !has_new_files || self.table.schema().core_options().write_only()? {
+        if !has_new_files
+            || !self.table.schema().primary_keys().is_empty()
+            || self.table.schema().core_options().write_only()?
+        {
             return Ok(false);
         }
         let definitions = definitions(&self.table)?;

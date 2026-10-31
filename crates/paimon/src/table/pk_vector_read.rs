@@ -300,11 +300,12 @@ async fn search_pk_raw_candidates_batch_with_plan(
     // Real ANN scorer + loader. Each segment source is opened lazily inside its
     // bucket leaf and dropped after scoring. Range reads load only metadata
     // and the index data needed for the search.
-    let options = {
-        let mut o = table.schema().options().clone();
-        o.extend(query_options.clone());
-        o
-    };
+    let options = super::vector_search_common::vector_read_options(
+        table.schema().options(),
+        query_options,
+        pk_col,
+        &index_type,
+    )?;
     let search_options = options.clone();
     let field_name = pk_col.to_string();
 

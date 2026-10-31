@@ -216,7 +216,11 @@ impl<'a> FullTextSearchBuilder<'a> {
                     message: "Text column must be set via with_text_column()".to_string(),
                 })?;
 
-        if !resolves_to_pk_full_text_path(&core, text_column) {
+        if !resolves_to_pk_full_text_path(
+            &core,
+            text_column,
+            !self.table.schema().primary_keys().is_empty(),
+        ) {
             return Err(crate::Error::Unsupported {
                 message: "materialized full-text read (execute_read) is only supported on the \
                           primary-key full-text path (data-evolution disabled and the column \
@@ -240,8 +244,13 @@ impl<'a> FullTextSearchBuilder<'a> {
 /// data-evolution is DISABLED and the column is a configured
 /// `pk-full-text.index.columns` entry (membership via the non-erroring accessor so
 /// a malformed config cannot abort an unrelated append/DE query).
-fn resolves_to_pk_full_text_path(core: &CoreOptions<'_>, text_column: &str) -> bool {
-    !core.data_evolution_enabled()
+fn resolves_to_pk_full_text_path(
+    core: &CoreOptions<'_>,
+    text_column: &str,
+    primary_key: bool,
+) -> bool {
+    primary_key
+        && !core.data_evolution_enabled()
         && core
             .primary_key_full_text_index_columns()
             .iter()
@@ -1899,15 +1908,16 @@ mod tests {
         ]);
         let core = CoreOptions::new(&de_on);
         assert!(
-            !resolves_to_pk_full_text_path(&core, "body"),
+            !resolves_to_pk_full_text_path(&core, "body", true),
             "data-evolution on must not resolve to the PK full-text path"
         );
         // Off + configured column -> PK path; a non-configured column -> not PK.
         let de_off =
             HashMap::from([("pk-full-text.index.columns".to_string(), "body".to_string())]);
         let core_off = CoreOptions::new(&de_off);
-        assert!(resolves_to_pk_full_text_path(&core_off, "body"));
-        assert!(!resolves_to_pk_full_text_path(&core_off, "other"));
+        assert!(resolves_to_pk_full_text_path(&core_off, "body", true));
+        assert!(!resolves_to_pk_full_text_path(&core_off, "other", true));
+        assert!(!resolves_to_pk_full_text_path(&core_off, "body", false));
     }
 
     // A non-positive limit must fail loud at construction, even on an empty table

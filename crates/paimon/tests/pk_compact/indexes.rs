@@ -19,6 +19,142 @@ use super::*;
 use paimon::spec::{should_read_pk_index_source, IndexManifest, PrimaryKeyIndexSourceMeta};
 use std::collections::HashSet;
 
+#[tokio::test]
+async fn unified_index_config_drives_pk_compaction_and_ranked_reads() {
+    use paimon::spec::{ArrayType, FloatType};
+    use std::sync::Arc;
+    for suffix in ["index-columns", "index-column"] {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column(
+                "embedding",
+                DataType::Array(ArrayType::new(DataType::Float(FloatType::new()))),
+            )
+            .column("text", DataType::VarChar(VarCharType::string_type()))
+            .primary_key(["id"])
+            .option("bucket", "1")
+            .option("deletion-vectors.enabled", "true")
+            .option("deletion-vectors.merge-on-read", "false")
+            .option(format!("global-index.btree.{suffix}"), "id")
+            .option(format!("global-index.full-text.{suffix}"), "text")
+            .option(format!("global-index.ivf-flat.{suffix}"), "embedding")
+            .option("ivf-flat.dimension", "9")
+            .option("fields.embedding.dimension", "2")
+            .option("fields.embedding.distance.metric", "cosine")
+            .option(
+                "fields.embedding.pk-vector.index.options",
+                "invalid legacy JSON",
+            )
+            .option(
+                "fields.embedding.index-options",
+                r#"{"nlist":1,"metric":"L2"}"#,
+            )
+            .option("full-text.lower-case", "true")
+            .option("fields.text.index-options", r#"{"lower-case":false}"#)
+            .option("global-index.enabled", "true")
+            .option("global-index.search-mode", "fast")
+            .build()
+            .unwrap();
+        // Exercise normal schema validation as well as the compact/read adapters.
+        let schema = TableSchema::new(0, &schema);
+        let table = table_with_schema(schema).await;
+        let vectors = vector_index_batch(vec![1, 2], vec![Some([1., 0.]), Some([0., 1.])]);
+        let batch = RecordBatch::try_from_iter([
+            ("id", vectors.column_by_name("id").unwrap().clone()),
+            (
+                "embedding",
+                vectors.column_by_name("embedding").unwrap().clone(),
+            ),
+            (
+                "text",
+                Arc::new(arrow_array::StringArray::from(vec!["MiXeD", "plain"]))
+                    as arrow_array::ArrayRef,
+            ),
+        ])
+        .unwrap();
+        write_batch(&table, &batch).await;
+        let builder = table
+            .new_compact_builder()
+            .with_commit_user("unified-index-options")
+            .unwrap();
+        let plan = builder.new_planner().unwrap().plan().await.unwrap();
+        builder
+            .new_commit()
+            .unwrap()
+            .commit_compact(execute(&table, &plan).await)
+            .await
+            .unwrap();
+        let entries = indexes(&table).await;
+        assert_eq!(entries.len(), 3);
+        let vector = entries
+            .iter()
+            .find(|e| e.index_file.index_type == "ivf-flat")
+            .unwrap();
+        let meta: std::collections::HashMap<String, String> = serde_json::from_slice(
+            vector
+                .index_file
+                .global_index_meta
+                .as_ref()
+                .unwrap()
+                .index_meta
+                .as_ref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(meta["dimension"], "2");
+        assert_eq!(meta["metric"], "l2");
+        let result = table
+            .new_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vector(vec![1., 0.])
+            .with_limit(1)
+            .execute()
+            .await
+            .unwrap();
+        let batches: Vec<RecordBatch> = result
+            .new_read_builder()
+            .with_projection(&["id"])
+            .read()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            batches[0]
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            1
+        );
+        for (query, count) in [("MiXeD", 1), ("mixed", 0)] {
+            let result = table
+                .new_full_text_search_builder()
+                .with_query("text", &format!(r#"{{"match":{{"query":"{query}"}}}}"#))
+                .with_limit(2)
+                .execute()
+                .await
+                .unwrap();
+            let batches: Vec<RecordBatch> = result
+                .new_read_builder()
+                .with_projection(&["id"])
+                .read()
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            assert_eq!(
+                batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                count
+            );
+        }
+    }
+}
+
 async fn vector_table_for_indexes(options: &[(&str, &str)]) -> Table {
     use paimon::spec::{ArrayType, FloatType};
     let mut schema = Schema::builder()
@@ -690,7 +826,7 @@ async fn vector_type_is_canonical_in_build_and_query() {
 }
 
 #[tokio::test]
-async fn conflicting_field_metric_is_rejected_before_build() {
+async fn legacy_field_metric_aliases_override_pk_metric_consistently() {
     for native in [
         r#"{"dimension":2,"nlist":1,"fields.embedding.metric":"cosine"}"#,
         r#"{"dimension":2,"nlist":1,"fields.embedding.distance.metric":"cosine"}"#,
@@ -701,7 +837,57 @@ async fn conflicting_field_metric_is_rejected_before_build() {
             ("fields.embedding.metric", "cosine"),
         ])
         .await;
-        assert!(table.new_compact_builder().new_planner().is_err());
+        assert_eq!(
+            table
+                .schema()
+                .core_options()
+                .primary_key_vector_distance_metric("embedding")
+                .unwrap(),
+            "cosine"
+        );
+        write_batch(
+            &table,
+            &vector_index_batch(vec![1, 2], vec![Some([100., 1.]), Some([1., 1.])]),
+        )
+        .await;
+        let builder = table
+            .new_compact_builder()
+            .with_commit_user("metric-alias-priority")
+            .unwrap();
+        let plan = builder.new_planner().unwrap().plan().await.unwrap();
+        builder
+            .new_commit()
+            .unwrap()
+            .commit_compact(execute(&table, &plan).await)
+            .await
+            .unwrap();
+        let result = table
+            .new_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vector(vec![1., 0.])
+            .with_limit(1)
+            .execute()
+            .await
+            .unwrap();
+        let batches: Vec<RecordBatch> = result
+            .new_read_builder()
+            .with_projection(&["id"])
+            .read()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            1,
+            "cosine must win over the legacy L2 option in both build and query"
+        );
     }
 }
 
@@ -1510,52 +1696,53 @@ async fn automatic_compaction_maintains_indexes_and_recovers_callback_failure() 
             Ok(())
         }
     }
-    let original = table(&[
-        ("pk-bitmap.index.columns", "value"),
-        ("compaction.force-up-level-0", "true"),
-    ])
-    .await;
-    let table = original
-        .copy_with_resolved_schema(
-            original
-                .schema()
-                .copy_with_options(std::collections::HashMap::from([(
-                    "write-only".into(),
-                    "false".into(),
-                )])),
-            "main",
-        )
-        .unwrap();
-    persist_table_schema(table.file_io(), table.location(), table.schema()).await;
-    let write = table.new_write_builder();
-    let mut writer = write.new_write().unwrap();
-    writer
-        .write_arrow_batch(&make_batch(vec![1, 2], vec![10, 20]))
-        .await
-        .unwrap();
-    let messages = writer.prepare_commit().await.unwrap();
-    let mut commit = write.new_commit();
-    commit
-        .add_commit_callback(Arc::new(FailOnce(AtomicBool::new(false))))
-        .unwrap();
-    assert!(commit
-        .commit_with_identifier(messages.clone(), 7)
-        .await
-        .unwrap_err()
-        .to_string()
-        .contains("pk-index callback failure"));
-    let snapshot = latest(&table).await;
-    assert_eq!(snapshot.commit_kind(), &CommitKind::COMPACT);
-    assert_eq!(snapshot.id(), 2);
-    let active = indexes(&table).await;
-    assert_eq!(active.len(), 1);
-    commit
-        .filter_and_commit_with_identifier(messages, 7)
-        .await
-        .unwrap();
-    assert_eq!(latest(&table).await.id(), 2);
-    assert_eq!(indexes(&table).await, active);
-    assert_eq!(filtered_rows(&table, 20).await, vec![(2, 20)]);
+    for key in [
+        "pk-bitmap.index.columns",
+        "global-index.bitmap.index-columns",
+    ] {
+        let original = table(&[(key, "value"), ("compaction.force-up-level-0", "true")]).await;
+        let table = original
+            .copy_with_resolved_schema(
+                original
+                    .schema()
+                    .copy_with_options(std::collections::HashMap::from([(
+                        "write-only".into(),
+                        "false".into(),
+                    )])),
+                "main",
+            )
+            .unwrap();
+        persist_table_schema(table.file_io(), table.location(), table.schema()).await;
+        let write = table.new_write_builder();
+        let mut writer = write.new_write().unwrap();
+        writer
+            .write_arrow_batch(&make_batch(vec![1, 2], vec![10, 20]))
+            .await
+            .unwrap();
+        let messages = writer.prepare_commit().await.unwrap();
+        let mut commit = write.new_commit();
+        commit
+            .add_commit_callback(Arc::new(FailOnce(AtomicBool::new(false))))
+            .unwrap();
+        assert!(commit
+            .commit_with_identifier(messages.clone(), 7)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("pk-index callback failure"));
+        let snapshot = latest(&table).await;
+        assert_eq!(snapshot.commit_kind(), &CommitKind::COMPACT);
+        assert_eq!(snapshot.id(), 2);
+        let active = indexes(&table).await;
+        assert_eq!(active.len(), 1);
+        commit
+            .filter_and_commit_with_identifier(messages, 7)
+            .await
+            .unwrap();
+        assert_eq!(latest(&table).await.id(), 2);
+        assert_eq!(indexes(&table).await, active);
+        assert_eq!(filtered_rows(&table, 20).await, vec![(2, 20)]);
+    }
 }
 
 async fn latest(table: &Table) -> paimon::spec::Snapshot {

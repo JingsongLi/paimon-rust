@@ -19,6 +19,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::spec::TableType;
 
+mod index_options;
+
 const DELETION_VECTORS_ENABLED_OPTION: &str = "deletion-vectors.enabled";
 const DELETION_VECTORS_MERGE_ON_READ_OPTION: &str = "deletion-vectors.merge-on-read";
 pub(crate) const QUERY_AUTH_ENABLED_OPTION: &str = "query-auth.enabled";
@@ -191,8 +193,6 @@ pub(crate) const BLOB_DESCRIPTOR_FIELD_FALLBACK: &str = "blob.stored-descriptor-
 pub(crate) const BLOB_VIEW_FIELD_OPTION: &str = "blob-view-field";
 pub(crate) const VIDEO_FRAME_FIELD_OPTION: &str = "video-frame-field";
 pub const BLOB_VIEW_RESOLVE_ENABLED_OPTION: &str = "blob-view.resolve.enabled";
-const PK_VECTOR_INDEX_COLUMNS_OPTION: &str = "pk-vector.index.columns";
-const PK_FULL_TEXT_INDEX_COLUMNS_OPTION: &str = "pk-full-text.index.columns";
 
 /// Merge engine for primary-key tables.
 ///
@@ -2169,21 +2169,21 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or_default()
     }
 
-    /// True when the PK-vector index column option key is present (regardless of value).
+    /// Whether a shared or legacy vector declaration is present.
     pub fn primary_key_vector_index_enabled(&self) -> bool {
-        self.options.contains_key(PK_VECTOR_INDEX_COLUMNS_OPTION)
+        !self.vector_index_columns().is_empty()
     }
 
     /// The configured PK-vector index columns, split on ',' and trimmed. Blank tokens
     /// are preserved so schema validation can reject malformed column lists.
     pub fn primary_key_vector_index_columns(&self) -> crate::Result<Vec<String>> {
-        let raw = self
-            .options
-            .get(PK_VECTOR_INDEX_COLUMNS_OPTION)
-            .ok_or_else(|| crate::Error::ConfigInvalid {
+        let columns = self.vector_index_columns();
+        if columns.is_empty() {
+            return Err(crate::Error::ConfigInvalid {
                 message: "pk-vector.index.columns is not set".to_string(),
-            })?;
-        Ok(raw.split(',').map(|c| c.trim().to_string()).collect())
+            });
+        }
+        Ok(columns)
     }
 
     /// The single PK-vector index column. The first release supports exactly one.
@@ -2203,10 +2203,7 @@ impl<'a> CoreOptions<'a> {
     /// The index type for a PK-vector column. Required — planning and the index reader
     /// both need it, so an absent value is a hard error rather than a guessed default.
     pub fn primary_key_vector_index_type(&self, col: &str) -> crate::Result<String> {
-        self.options
-            .get(&format!("fields.{col}.pk-vector.index.type"))
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
+        self.vector_index_type(col)?
             .ok_or_else(|| crate::Error::ConfigInvalid {
                 message: format!("fields.{col}.pk-vector.index.type is required but not set"),
             })
@@ -2215,6 +2212,22 @@ impl<'a> CoreOptions<'a> {
     /// The distance metric name for a PK-vector column, defaulting to inner_product.
     /// Validated against the supported metrics; an unknown value is a hard error.
     pub fn primary_key_vector_distance_metric(&self, col: &str) -> crate::Result<String> {
+        if let Some(kind) = self.vector_index_type(col)? {
+            return self
+                .vector_index_options(&kind, col, true)?
+                .get(&format!("{kind}.metric"))
+                .cloned()
+                .ok_or_else(|| crate::Error::ConfigInvalid {
+                    message: format!("Unsupported vector index type: {kind}"),
+                });
+        }
+        self.legacy_primary_key_vector_distance_metric(col)
+    }
+
+    pub(crate) fn legacy_primary_key_vector_distance_metric(
+        &self,
+        col: &str,
+    ) -> crate::Result<String> {
         let raw = self
             .options
             .get(&format!("fields.{col}.pk-vector.distance.metric"))
@@ -2227,7 +2240,7 @@ impl<'a> CoreOptions<'a> {
 
     /// True when the PK full-text index column option key is present (any value).
     pub fn primary_key_full_text_index_enabled(&self) -> bool {
-        self.options.contains_key(PK_FULL_TEXT_INDEX_COLUMNS_OPTION)
+        !self.primary_key_full_text_index_columns().is_empty()
     }
 
     /// Configured PK full-text index columns: split on ',' and trim each token,
@@ -2236,10 +2249,7 @@ impl<'a> CoreOptions<'a> {
     /// absent. Never returns a `Result`, never errors (do not copy the fail-loud
     /// shape of `primary_key_vector_index_columns`).
     pub fn primary_key_full_text_index_columns(&self) -> Vec<String> {
-        match self.options.get(PK_FULL_TEXT_INDEX_COLUMNS_OPTION) {
-            None => Vec::new(),
-            Some(raw) => raw.split(',').map(|c| c.trim().to_string()).collect(),
-        }
+        self.global_index_columns("full-text")
     }
 }
 
@@ -4343,7 +4353,7 @@ mod tests {
         );
         assert_eq!(
             co.primary_key_vector_distance_metric("embedding").unwrap(),
-            "Inner-Product"
+            "inner_product"
         );
     }
 

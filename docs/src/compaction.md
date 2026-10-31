@@ -108,9 +108,11 @@ Rust, Python, and DataFusion writes share this behavior. Tables without index
 declarations retain their existing write behavior; no separate index switch is
 required and no background job is scheduled.
 
-Index options follow the primary-key index convention: a comma-separated column
-list for each family and optional per-column parameters. Supported families are
-`btree`, `bitmap`, `multivalue`, `fm`, `full-text`, and `vector`:
+Primary-key and append/Data Evolution tables share the same configuration:
+`global-index.<type>.index-columns` declares comma-separated columns, and
+`fields.<column>.index-options` supplies a JSON object of field parameters.
+Supported types are `btree`, `bitmap`, `multivalue`, `fm`, `full-text`,
+`ivf-flat`, `ivf-sq`, `ivf-pq`, `ivf-rq`, and `diskann`:
 
 ```rust
 let options = std::collections::HashMap::from([
@@ -120,15 +122,13 @@ let options = std::collections::HashMap::from([
     ("global-index.btree.index-columns".into(), "id,age".into()),
     ("global-index.full-text.index-columns".into(), "text".into()),
     (
-        "fields.text.global-index.full-text.index-options".into(),
+        "fields.text.index-options".into(),
         r#"{"lower-case":true}"#.into(),
     ),
-    ("global-index.vector.index-columns".into(), "embedding".into()),
-    ("fields.embedding.global-index.vector.index-type".into(), "diskann".into()),
-    ("fields.embedding.global-index.vector.distance-metric".into(), "cosine".into()),
+    ("global-index.diskann.index-columns".into(), "embedding".into()),
     (
-        "fields.embedding.global-index.vector.index-options".into(),
-        r#"{"dimension":768}"#.into(),
+        "fields.embedding.index-options".into(),
+        r#"{"dimension":768,"distance.metric":"cosine"}"#.into(),
     ),
 ]);
 ```
@@ -142,16 +142,49 @@ are trimmed; empty names, duplicates, unknown fields, and assigning multiple
 families to one column are rejected before data publication. Each listed column
 has its own index. Use the explicit build API for composite BTree indexes.
 Update the lists and per-column option keys together with schema renames or drops.
-`write-only=true` skips automatic index configuration validation.
+`write-only=true` skips automatic maintenance. Shared declarations and native
+parameters are validated when the corresponding index path is used; existing
+Rust PK schema prerequisites still apply.
 
-Per-column parameters use
-`fields.<column>.global-index.<family>.index-options`, a JSON object containing
-string, boolean, or numeric values. Short keys are qualified with the native
-writer prefix, such as `block-size` to `btree-index.block-size`. Fully qualified
-writer keys and shared shard options are accepted. Conflicting native writer
-values are rejected, matching primary-key option resolution. Vector columns
-additionally require `fields.<column>.global-index.vector.index-type`; the optional
-`distance-metric` defaults to `inner_product`.
+Short JSON keys are qualified with the implementation prefix: `block-size`
+becomes `btree-index.block-size`, and vector `nlist` becomes `ivf-pq.nlist`.
+String, boolean and numeric values are accepted; full-text arrays such as
+`stop-words` use the native semicolon-separated encoding. The shared JSON
+overrides table implementation defaults. Vector metrics default to
+`inner_product`, and accepted metric aliases resolve consistently for builds,
+indexed reads, raw scoring and refinement.
+
+Compatibility and precedence follow Java's shared configuration resolver:
+
+- Declarations prefer `global-index.<type>.index-columns`, then the DLF singular
+  `global-index.<type>.index-column`, then legacy `pk-<family>.index.columns`.
+  An explicitly empty preferred declaration is invalid rather than falling back.
+- Field JSON prefers `fields.<column>.index-options`, then the existing Rust
+  `fields.<column>.global-index.<family>.index-options`, then legacy
+  `fields.<column>.pk-<family>.index.options`. Shared JSON replaces legacy JSON;
+  it can override defaults, while non-metric legacy conflicts remain errors.
+  Vector metric aliases are resolved together after JSON merging, so field JSON
+  overrides legacy metric properties and case-only aliases stay compatible.
+- Legacy `pk-vector` declarations still select the algorithm through
+  `fields.<column>.pk-vector.index.type`. The former Rust
+  `global-index.vector` declaration and field algorithm/metric keys remain aliases.
+  That older Rust declaration retains its metric/default priority over flat
+  aliases until replaced by a concrete declaration or shared field JSON.
+- DLF implementation parameters such as `ivf-pq.dimension` and flat field
+  overrides such as `fields.embedding.dimension`, `distance.metric`, `nlist` and
+  `pq.m` remain supported. Shared vector JSON overrides those flat parameters.
+  `fields.<column>.global-index.row-count-per-shard` overrides the shard size
+  for that column. Morax scheduling switches do not control Rust maintenance.
+
+The configuration is shared; table modes retain their validation and lifecycle.
+PK indexes are maintained with data compaction, while append/DE indexes retain
+global row-ID coverage and the incremental/consolidation policy below.
+
+Upgrade readers and writers before switching PK tables to shared-only keys.
+During a mixed-version rollout, retain the legacy declarations and field values
+alongside the shared keys and keep their effective definitions aligned; older
+clients still depend on the legacy PK namespace. Existing stored options do not
+need migration for the updated resolver.
 Explicit single-column builds also use these declarations as defaults; explicit
 builder options take precedence over them.
 FULL/DETAIL raw fallback uses the same per-column parameters as automatic
@@ -306,8 +339,9 @@ snapshot expiration and storage reclamation are separate maintenance work.
 
 ## Primary-key compaction
 
-Primary-key compaction also maintains declared source-backed indexes, using
-Java's primary-key options:
+Primary-key compaction maintains declared source-backed indexes using the same
+`global-index.<type>.index-columns` and `fields.<column>.index-options` options
+shown above. Existing Java primary-key configurations remain compatible:
 
 | Option | Meaning |
 | --- | --- |

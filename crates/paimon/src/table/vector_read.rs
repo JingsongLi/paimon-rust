@@ -87,7 +87,7 @@ impl BatchVectorRead {
         context: PlanContext,
     ) -> crate::Result<Self> {
         let core = CoreOptions::new(table.schema().options());
-        let reader = if targets_primary_key_column(&core, column) {
+        let reader = if targets_primary_key_column(table, column) {
             let pk_col = core.primary_key_vector_index_column()?;
             let params =
                 PkVectorSearchParams::resolve(table, options, filter, &pk_col, queries, limit)?;
